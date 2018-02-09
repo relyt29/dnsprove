@@ -5,12 +5,13 @@
 package proveAPI
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/arachnid/dnsprove/proofs"
-	"github.com/miekg/dns"
 	log "github.com/inconshreveable/log15"
+	"github.com/miekg/dns"
 )
 
 type dnskeyEntry struct {
@@ -136,7 +137,11 @@ func (client *Client) verifyRRSet(sig *dns.RRSIG, rrs []dns.RR) ([]proofs.Signed
 	} else {
 		// Find the keys that signed this RRSET
 		sets, err = client.QueryWithProof(dns.TypeDNSKEY, sig.Header().Class, sig.SignerName)
-		keys = sets[len(sets)-1].Rrs
+		if len(sets) == 0 {
+			err = errors.New("No key signed the RRSET, check DNSSEC configuration.")
+		} else {
+			keys = sets[len(sets)-1].Rrs
+		}
 	}
 	if err != nil {
 		return nil, err
