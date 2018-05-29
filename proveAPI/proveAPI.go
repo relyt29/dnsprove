@@ -5,27 +5,59 @@
 package proveAPI
 
 import (
-	"errors"
 	"fmt"
 	"strings"
+	"flag"
+	"bytes"
+	"io/ioutil"
+	"net/http"
 
 	"github.com/arachnid/dnsprove/proofs"
 	log "github.com/inconshreveable/log15"
 	"github.com/miekg/dns"
 )
 
+var (
+	server          = flag.String("server", "https://dns.google.com/experimental", "The URL of the dns-over-https server to use")
+	hashes          = flag.String("hashes", "SHA256", "a comma-separated list of supported hash algorithms")
+	algorithms      = flag.String("algorithms", "RSASHA256", "a comma-separated list of supported digest algorithms")
+	verbosity       = flag.Int("verbosity", 3, "logging level verbosity (0-4)")
+	print           = flag.Bool("print", false, "don't upload to the contract, just print proof data")
+	rpc             = flag.String("rpc", "http://localhost:8545", "RPC path to Ethereum node")
+	address         = flag.String("address", "", "Contract address for DNSSEC oracle")
+	keyfile         = flag.String("keyfile", "", "Path to JSON keyfile")
+	gasprice        = flag.Float64("gasprice", 5.0, "Gas price, in gwei")
+	yes             = flag.Bool("yes", false, "Do not prompt before sending transactions")
+	trustAnchors = []*dns.DS{
+		&dns.DS{
+			Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeDS, Class: dns.ClassINET},
+			KeyTag: 19036,
+			Algorithm: 8,
+			DigestType: 2,
+			Digest: "49AAC11D7B6F6446702E54A1607371607A1A41855200FD2CE1CDDE32F24E8FB5",
+		},
+		&dns.DS{
+			Hdr: dns.RR_Header{Name: ".", Rrtype: dns.TypeDS, Class: dns.ClassINET},
+			KeyTag: 20326,
+			Algorithm: 8,
+			DigestType: 2,
+			Digest: "E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
+		},
+	}
+)
+
 type dnskeyEntry struct {
-	name      string
+	name string
 	algorithm uint8
-	keytag    uint16
+	keytag uint16
 }
 
 type Client struct {
-	c                   *dns.Client
-	nameserver          string
-	knownHashes         map[dnskeyEntry][]*dns.DS
+	c *dns.Client
+	nameserver string
+	knownHashes map[dnskeyEntry][]*dns.DS
 	supportedAlgorithms map[uint8]struct{}
-	supportedDigests    map[uint8]struct{}
+	supportedDigests map[uint8]struct{}
 }
 
 func (client *Client) addDS(ds *dns.DS) {
@@ -45,11 +77,11 @@ func (client *Client) supportsDigest(digest uint8) bool {
 
 func NewClient(nameserver string, roots []*dns.DS, algorithms, digests map[uint8]struct{}) *Client {
 	client := &Client{
-		c:                   new(dns.Client),
-		nameserver:          nameserver,
-		knownHashes:         make(map[dnskeyEntry][]*dns.DS),
+		c: new(dns.Client),
+		nameserver: nameserver,
+		knownHashes: make(map[dnskeyEntry][]*dns.DS),
 		supportedAlgorithms: algorithms,
-		supportedDigests:    digests,
+		supportedDigests: digests,
 	}
 	for _, root := range roots {
 		client.addDS(root)
@@ -68,8 +100,8 @@ func (client *Client) Query(qtype uint16, qclass uint16, name string) (*dns.Msg,
 		},
 		Question: []dns.Question{
 			dns.Question{
-				Name:   dns.Fqdn(name),
-				Qtype:  qtype,
+				Name: dns.Fqdn(name),
+				Qtype: qtype,
 				Qclass: qclass,
 			},
 		},
@@ -86,41 +118,62 @@ func (client *Client) Query(qtype uint16, qclass uint16, name string) (*dns.Msg,
 	m.Extra = append(m.Extra, o)
 	m.Id = dns.Id()
 
-	r, _, err := client.c.Exchange(m, client.nameserver)
-	if err == nil {
-		log.Debug("DNS response:\n" + r.String())
-		log.Info("DNS query", "class", dns.ClassToString[qclass], "type", dns.TypeToString[qtype], "name", name, "answers", len(r.Answer), "nses", len(r.Ns))
-	}
-	return r, err
-}
-
-func (client *Client) QueryWithProof(qtype, qclass uint16, name string) ([]proofs.SignedSet, error) {
-	if name[len(name)-1] != '.' {
-		name = name + "."
-	}
-
-	r, err := client.Query(qtype, qclass, name)
+	req, err := m.Pack()
 	if err != nil {
 		return nil, err
 	}
 
-	sigs := filterRRs(r.Answer, dns.TypeRRSIG)
-	rrs := getRRset(r.Answer, name, qtype)
-	if len(sigs) == 0 || len(rrs) == 0 {
-		return nil, fmt.Errorf("No signed RRSETs available for %s %s %s", dns.ClassToString[qclass], dns.TypeToString[qtype], name)
+	response, err := http.Post(client.nameserver, "application/dns-udpwireformat", bytes.NewReader(req))
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != 200 {
+		return nil, fmt.Errorf("Got unexpected status from server: %s", response.Status)
 	}
 
-	for _, sig := range sigs {
-		sig := sig.(*dns.RRSIG)
-		ret, err := client.verifyRRSet(sig, rrs)
-		if err == nil {
-			ret = append(ret, proofs.SignedSet{sig, rrs})
-			return ret, nil
+	data, err := ioutil.ReadAll(response.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var r dns.Msg
+	err = r.Unpack(data)
+	if err == nil {
+		log.Debug("DNS response:\n" + r.String())
+		log.Info("DNS query", "class", dns.ClassToString[qclass], "type", dns.TypeToString[qtype], "name", name, "answers", len(r.Answer), "nses", len(r.Ns))
+	}
+	return &r, err
+}
+
+func (client *Client) QueryWithProof(qtype, qclass uint16, name string) ([]proofs.SignedSet, error) {
+		if name[len(name) - 1] != '.' {
+			name = name + "."
 		}
-		log.Warn("Failed to verify RRSET", "class", dns.ClassToString[qclass], "type", dns.TypeToString[qtype], "name", name, "signername", sig.SignerName, "algorithm", dns.AlgorithmToString[sig.Algorithm], "keytag", sig.KeyTag, "err", err)
-	}
 
-	return nil, fmt.Errorf("Could not validate %s %s %s: no valid signatures found", dns.ClassToString[qclass], dns.TypeToString[qtype], name)
+		r, err := client.Query(qtype, qclass, name)
+		if err != nil {
+			return nil, err
+		}
+
+		sigs := filterRRs(r.Answer, dns.TypeRRSIG)
+		rrs := getRRset(r.Answer, name, qtype)
+		if len(sigs) == 0 || len(rrs) == 0 {
+			return nil, fmt.Errorf("No signed RRSETs available for %s %s %s", dns.ClassToString[qclass], dns.TypeToString[qtype], name)
+		}
+
+		for _, sig := range sigs {
+			sig := sig.(*dns.RRSIG)
+			ret, err := client.verifyRRSet(sig, rrs)
+			if err == nil {
+				ret = append(ret, proofs.SignedSet{sig, rrs, name})
+				return ret, nil
+			}
+			log.Warn("Failed to verify RRSET", "class", dns.ClassToString[qclass], "type", dns.TypeToString[qtype], "name", name, "signername", sig.SignerName, "algorithm", dns.AlgorithmToString[sig.Algorithm], "keytag", sig.KeyTag, "err", err)
+		}
+
+		return nil, fmt.Errorf("Could not validate %s %s %s: no valid signatures found", dns.ClassToString[qclass], dns.TypeToString[qtype], name)
 }
 
 func (client *Client) verifyRRSet(sig *dns.RRSIG, rrs []dns.RR) ([]proofs.SignedSet, error) {
@@ -137,14 +190,10 @@ func (client *Client) verifyRRSet(sig *dns.RRSIG, rrs []dns.RR) ([]proofs.Signed
 	} else {
 		// Find the keys that signed this RRSET
 		sets, err = client.QueryWithProof(dns.TypeDNSKEY, sig.Header().Class, sig.SignerName)
-		if len(sets) == 0 {
-			err = errors.New("No key signed the RRSET, check DNSSEC configuration.")
-		} else {
-			keys = sets[len(sets)-1].Rrs
+		if err != nil {
+			return nil, err
 		}
-	}
-	if err != nil {
-		return nil, err
+		keys = sets[len(sets)-1].Rrs
 	}
 
 	// Iterate over the keys looking for one that validly signs our RRSET
@@ -185,7 +234,7 @@ func (client *Client) verifyWithDS(key *dns.DNSKEY) ([]proofs.SignedSet, error) 
 	if err != nil {
 		return nil, err
 	}
-	for _, ds := range sets[len(sets)-1].Rrs {
+	for _, ds := range sets[len(sets) - 1].Rrs {
 		ds := ds.(*dns.DS)
 		if !client.supportsDigest(ds.DigestType) {
 			continue

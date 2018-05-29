@@ -10,12 +10,11 @@ import (
 	"flag"
 	"fmt"
 	"math/big"
-	"net"
 	"os"
 	"strings"
 
 	"github.com/arachnid/dnsprove/oracle"
-    "github.com/relyt29/dnsprove/proveAPI"
+	"github.com/relyt29/dnsprove/proveAPI"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/miekg/dns"
@@ -25,6 +24,7 @@ import (
 )
 
 var (
+	server          = flag.String("server", "https://dns.google.com/experimental", "The URL of the dns-over-https server to use")
 	hashes          = flag.String("hashes", "SHA256", "a comma-separated list of supported hash algorithms")
 	algorithms      = flag.String("algorithms", "RSASHA256", "a comma-separated list of supported digest algorithms")
 	verbosity       = flag.Int("verbosity", 3, "logging level verbosity (0-4)")
@@ -83,18 +83,11 @@ func main() {
 		algmap[dns.StringToAlgorithm[algname]] = struct{}{}
 	}
 
-	conf, err := dns.ClientConfigFromFile("/etc/resolv.conf")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(2)
-	}
-	nameserver := net.JoinHostPort(conf.Servers[0], "53")
-
-	client := proveAPI.NewClient(nameserver, trustAnchors, algmap, hashmap)
+	client := proveAPI.NewClient(*server, trustAnchors, algmap, hashmap)
 	sets, err := client.QueryWithProof(qtype, qclass, name)
 	if err != nil {
 		log.Crit("Error resolving", "name", name, "err", err)
-		return
+		os.Exit(1)
 	}
 
 	if *print {
@@ -110,7 +103,7 @@ func main() {
 				log.Crit("Error packing RRSet", "err", err)
 				os.Exit(1)
 			}
-			fmt.Printf("[\"%x\", \"%x\"],\n", data, sig)
+			fmt.Printf("[\"%s\", \"%x\", \"%x\"],\n", proof.Name, data, sig)
 		}
 	} else {
 		conn, err := ethclient.Dial(*rpc)
