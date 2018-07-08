@@ -7,6 +7,7 @@
 package main
 
 import (
+    "context"
 	"flag"
 	"fmt"
 	"math/big"
@@ -17,6 +18,7 @@ import (
 	"github.com/relyt29/dnsprove/proveAPI"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/miekg/dns"
 	"github.com/ethereum/go-ethereum/ethclient"
 	log "github.com/inconshreveable/log15"
@@ -72,6 +74,9 @@ func main() {
 	}
 	qclass := uint16(dns.ClassINET)
 	name := flag.Arg(1)
+	if !strings.HasSuffix(name, ".") {
+		name = name + "."
+	}
 
 	hashmap := make(map[uint8]struct{})
 	for _, hashname := range strings.Split(*hashes, ",") {
@@ -84,7 +89,7 @@ func main() {
 	}
 
 	client := proveAPI.NewClient(*server, trustAnchors, algmap, hashmap)
-	sets, err := client.QueryWithProof(qtype, qclass, name)
+	sets, found, err := client.QueryWithProof(qtype, qclass, name)
 	if err != nil {
 		log.Crit("Error resolving", "name", name, "err", err)
 		os.Exit(1)
@@ -98,68 +103,118 @@ func main() {
 					fmt.Printf("// %s\n", line)
 				}
 			}
-			data, sig, err := proof.Pack()
+			data, err := proof.Pack()
 			if err != nil {
 				log.Crit("Error packing RRSet", "err", err)
 				os.Exit(1)
 			}
+			sig, err := proof.PackSignature()
+			if err != nil {
+				log.Crit("Error packing RRSet signature", "err", err)
+				os.Exit(1)
+			}
 			fmt.Printf("[\"%s\", \"%x\", \"%x\"],\n", proof.Name, data, sig)
 		}
+		os.Exit(0)
+	}
+
+	conn, err := ethclient.Dial(*rpc)
+	if err != nil {
+		log.Crit("Error connecting to Ethereum node", "err", err)
+		os.Exit(1)
+	}
+
+	o, err := oracle.NewOracle(common.HexToAddress(*address), conn)
+	if err != nil {
+		log.Crit("Error creating oracle", "err", err)
+		os.Exit(1)
+	}
+
+	if !found {
+		// We're deleting a domain. If it's not already there, there's nothing to do.
+		_, _, hash, err := o.Rrdata(qtype, name)
+		if err != nil {
+			log.Crit("Error checking RRDATA", "qtype", qtype, "name", name, "err", err)
+			os.Exit(1)
+		}
+		if hash == [20]byte{} {
+			fmt.Printf("RRSet not found in oracle. Nothing to do; exiting\n")
+			os.Exit(0)
+		}
 	} else {
-		conn, err := ethclient.Dial(*rpc)
+		// If the RRset already matches, there's nothing to do
+		matches, err := o.RecordMatches(sets[len(sets) - 1])
 		if err != nil {
-			log.Crit("Error connecting to Ethereum node", "err", err)
+			log.Crit("Error checking for record", "err", err)
 			os.Exit(1)
 		}
-
-		o, err := oracle.NewOracle(common.HexToAddress(*address), conn)
-		if err != nil {
-			log.Crit("Error creating oracle", "err", err)
-			os.Exit(1)
-		}
-
-		sets, err = o.FilterProofs(sets)
-		if err != nil {
-			log.Crit("Error filtering proofs", "err", err)
-			os.Exit(1)
-		}
-
-		if len(sets) == 0 {
+		if matches && found {
 			fmt.Printf("Nothing to do; exiting.\n")
 			os.Exit(0)
 		}
+	}
 
-		if !*yes {
-			if !prompt.Confirm("Send %d transactions to prove %s %s onchain?", len(sets), dns.TypeToString[qtype], name) {
-				fmt.Printf("Exiting at user request.\n")
-				return
-			}
+	known, err := o.FindFirstUnknownProof(sets, found)
+	if err != nil {
+		log.Crit("Error checking proofs against oracle", "err", err)
+		os.Exit(1)
+	}
+
+	if !*yes {
+		if !prompt.Confirm("Send %d transactions to prove %s %s onchain?", len(sets) - known, dns.TypeToString[sets[len(sets) - 1].Rrs[0].Header().Rrtype], name) {
+			fmt.Printf("Exiting at user request.\n")
+			return
 		}
+	}
 
-		key, err := os.Open(*keyfile)
+	key, err := os.Open(*keyfile)
+	if err != nil {
+		log.Crit("Could not open keyfile", "err", err)
+		os.Exit(1)
+	}
+
+	pass := prompt.Password("Password")
+	auth, err := bind.NewTransactor(key, pass)
+	if err != nil {
+		log.Crit("Could not create transactor", "err", err)
+		os.Exit(1)
+	}
+	auth.GasPrice = big.NewInt(int64(*gasprice * 1000000000))
+
+	nonce, err := conn.PendingNonceAt(context.TODO(), auth.From)
+    if err != nil {
+		log.Crit("Could not fetch nonce", "err", err)
+		os.Exit(1)
+    }
+	auth.Nonce = big.NewInt(int64(nonce))
+
+	var txs []*types.Transaction
+	if found {
+		txs, _, err = o.SendProofs(auth, sets, known, found)
 		if err != nil {
-			log.Crit("Could not open keyfile", "err", err)
+			log.Crit("Error sending proofs", "err", err)
 			os.Exit(1)
 		}
-
-		pass := prompt.Password("Password")
-		auth, err := bind.NewTransactor(key, pass)
-		if err != nil {
-			log.Crit("Could not create transactor", "err", err)
-			os.Exit(1)
-		}
-		auth.GasPrice = big.NewInt(int64(*gasprice * 1000000000))
-
-		txs, err := o.SendProofs(auth, sets)
+	} else {
+		nsec := sets[len(sets) - 1]
+		var proof []byte
+		txs, proof, err = o.SendProofs(auth, sets[:len(sets) - 1], known, found)
 		if err != nil {
 			log.Crit("Error sending proofs", "err", err)
 			os.Exit(1)
 		}
 
-		txids := make([]common.Hash, 0, len(txs))
-		for _, tx := range txs {
-			txids = append(txids, tx.Hash())
+		deletetx, err := o.DeleteRRSet(auth, qtype, name, nsec, proof)
+		if err != nil {
+			log.Crit("Error deleting RRSet", "err", err)
+			os.Exit(1)
 		}
-		log.Info("Transactions sent", "txids", txids)
+		txs = append(txs, deletetx)
 	}
+
+	txids := make([]string, 0, len(txs))
+	for _, tx := range txs {
+		txids = append(txids, tx.Hash().String())
+	}
+	log.Info("Transactions sent", "txids", txids)
 }
